@@ -76,7 +76,26 @@ class SingletonMeta(type):
         cls._instances = {}
 
 
+def _npu_rewrite_paths(cmd: str) -> str:
+    """Rewrite hardcoded /root asset paths when this process runs on NPU.
+
+    Lazy imports keep CPU/CUDA paths free of the platform package and avoid an
+    import cycle (launch.py imports nothing from misc).
+    """
+    try:
+        from vime.platforms import current_platform
+
+        if current_platform().name != "npu":
+            return cmd
+        from vime.utils.external_utils.launch import _rewrite_npu_paths
+
+        return _rewrite_npu_paths(cmd)
+    except ImportError:
+        return cmd
+
+
 def exec_command(cmd: str, capture_output: bool = False) -> str | None:
+    cmd = _npu_rewrite_paths(cmd)
     print(f"EXEC: {cmd}", flush=True)
 
     try:
