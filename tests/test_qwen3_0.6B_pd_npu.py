@@ -134,6 +134,7 @@ def _train_args(*, pd_enabled: bool, num_rollout: int, debug_data: Path) -> str:
         "--accumulate-allreduce-grads-in-fp32 "
         "--attention-softmax-in-fp32 "
         "--attention-backend flash "
+        "--vllm-additional-config '{\"weight_nz_mode\":0}' "
         "--actor-num-nodes 1 "
         "--actor-num-gpus-per-node 1 "
     )
