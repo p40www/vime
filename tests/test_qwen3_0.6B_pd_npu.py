@@ -125,6 +125,10 @@ def _train_args(*, pd_enabled: bool, num_rollout: int, debug_data: Path) -> str:
 
     verify_args = (
         "--ci-test "
+        # Greedy (top-k 1) decoding shifts the vLLM-side logprobs reported to
+        # training, so the default 0.1 alignment threshold does not apply to
+        # this consistency-oriented smoke.
+        "--ci-train-rollout-logprob-abs-diff-threshold 1.0 "
         "--check-weight-update-equal "
         f"--save-debug-rollout-data {shlex.quote(str(debug_data / 'rollout_{rollout_id}.pt'))} "
     )
