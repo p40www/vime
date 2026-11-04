@@ -81,6 +81,7 @@ def _train_args(*, pd_enabled: bool, num_rollout: int, debug_data: Path) -> str:
         "--n-samples-per-prompt 4 "
         "--rollout-max-response-len 1024 "
         "--rollout-temperature 1.0 "
+        "--rollout-top-k 1 "
         "--global-batch-size 16 "
     )
 
