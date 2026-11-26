@@ -707,6 +707,12 @@ def train_one_step(
             )
         return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
 
+    # Release allocator-cached blocks before the step as well: long-context runs
+    # fragment the classic caching allocator, and the in-step logits-gradient
+    # allocation can fail on idle-but-fragmented blocks (see --clear-memory-per-step).
+    if getattr(args, "clear_memory_per_step", False):
+        clear_memory()
+
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
