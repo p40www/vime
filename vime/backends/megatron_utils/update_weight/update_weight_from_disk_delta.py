@@ -21,7 +21,11 @@ from ray.actor import ActorHandle
 from vime.utils import accelerator
 from vime.utils.disk_delta import NUM_WORKERS, checksum, overwrite_encode
 from vime.utils.distributed_utils import get_gloo_group
-from vime.utils.weight_sync import should_flush_cache
+from vime.utils.weight_sync import (
+    pause_engines_for_weight_update,
+    resume_engines_after_weight_update,
+    should_flush_cache,
+)
 
 from ..hf_checkpoint_saver import _copy_hf_assets, _finalize_distributed_shards, _SafetensorShardWriter
 from .update_weight_from_distributed import UpdateWeightFromDistributed
@@ -93,11 +97,7 @@ class UpdateWeightFromDiskDelta(UpdateWeightFromDistributed):
             if dist.get_rank() == 0:
                 version[0] = max(
                     [self.weight_version]
-                    + [
-                        int(path.name[8:])
-                        for path in Path(self.delta_dir).glob("weight_v*")
-                        if path.name[8:].isdigit()
-                    ]
+                    + [int(path.name[8:]) for path in Path(self.delta_dir).glob("weight_v*") if path.name[8:].isdigit()]
                 )
             dist.broadcast_object_list(version, src=0, group=get_gloo_group())
             self.weight_version = version[0]
@@ -182,32 +182,30 @@ class UpdateWeightFromDiskDelta(UpdateWeightFromDistributed):
         if self._post_write_hook is not None:
             self._post_write_hook(self.args, self._version_dir, list(self.rollout_engines))
         dist.barrier(group=get_gloo_group())
+        engines = self.rollout_engines
         if dist.get_rank() == 0:
             flush_cache = should_flush_cache(
                 self.args.flush_cache_interval,
                 self.weight_version,
                 getattr(self.args, "update_weight_start_version", 0),
             )
-            ray.get([engine.pull_weights.remote(self.weight_version) for engine in self.rollout_engines])
-            ray.get(
-                [
-                    engine.pause_generation.remote(mode="abort" if flush_cache else "in_place")
-                    for engine in self.rollout_engines
-                ]
-            )
-            if flush_cache:
-                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            ray.get(
-                [
-                    engine.update_weights_from_disk.remote(
-                        model_path=self.args.update_weight_local_checkpoint_dir,
-                        weight_version=str(self.weight_version),
-                        flush_cache=flush_cache,
-                    )
-                    for engine in self.rollout_engines
-                ]
-            )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            ray.get([engine.pull_weights.remote(self.weight_version) for engine in engines])
+            pause_engines_for_weight_update(engines, flush_cache)
+            try:
+                if flush_cache:
+                    ray.get([engine.flush_cache.remote() for engine in engines])
+                ray.get(
+                    [
+                        engine.update_weights_from_disk.remote(
+                            model_path=self.args.update_weight_local_checkpoint_dir,
+                            weight_version=str(self.weight_version),
+                            flush_cache=flush_cache,
+                        )
+                        for engine in engines
+                    ]
+                )
+            finally:
+                resume_engines_after_weight_update(engines)
         dist.barrier(group=get_gloo_group())
 
     def _iter_hf_tensors(self):

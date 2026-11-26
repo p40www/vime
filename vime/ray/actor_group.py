@@ -11,7 +11,11 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from vime.platforms import current_platform
 from vime.ray.training_recovery import configure_recovery_checkpoint, training_recovery_enabled
 from vime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
-from vime.utils.weight_sync import should_flush_cache
+from vime.utils.weight_sync import (
+    pause_engines_for_weight_update,
+    resume_engines_after_weight_update,
+    should_flush_cache,
+)
 
 
 class RayTrainGroup:
@@ -272,31 +276,33 @@ class RayTrainGroup:
         flush_cache = should_flush_cache(
             self.args.flush_cache_interval, int(weight_version), getattr(self.args, "update_weight_start_version", 0)
         )
-        ray.get([engine.pause_generation.remote(mode="abort" if flush_cache else "in_place") for engine in engines])
-        if flush_cache:
-            ray.get([engine.flush_cache.remote() for engine in engines])
-        ray.get(
-            [
-                engine.update_weights_from_disk.remote(
-                    model_path=model_path,
-                    weight_version=weight_version,
-                    flush_cache=flush_cache,
-                )
-                for engine in engines
-            ]
-        )
-        if self.args.ci_test:
-            engine_versions = ray.get([engine.get_weight_version.remote() for engine in engines])
-            mismatches = [
-                f"engine {idx}: {engine_version}"
-                for idx, engine_version in enumerate(engine_versions)
-                if str(engine_version) != str(weight_version)
-            ]
-            if mismatches:
-                raise RuntimeError(
-                    "Weight version mismatch after disk reload! "
-                    f"Expected: {weight_version}; " + ", ".join(mismatches)
-                )
-        if not self.args.update_weight_disk_keep_files:
-            shutil.rmtree(disk_weight_dir, ignore_errors=True)
-        ray.get([engine.continue_generation.remote() for engine in engines])
+        pause_engines_for_weight_update(engines, flush_cache)
+        try:
+            if flush_cache:
+                ray.get([engine.flush_cache.remote() for engine in engines])
+            ray.get(
+                [
+                    engine.update_weights_from_disk.remote(
+                        model_path=model_path,
+                        weight_version=weight_version,
+                        flush_cache=flush_cache,
+                    )
+                    for engine in engines
+                ]
+            )
+            if self.args.ci_test:
+                engine_versions = ray.get([engine.get_weight_version.remote() for engine in engines])
+                mismatches = [
+                    f"engine {idx}: {engine_version}"
+                    for idx, engine_version in enumerate(engine_versions)
+                    if str(engine_version) != str(weight_version)
+                ]
+                if mismatches:
+                    raise RuntimeError(
+                        "Weight version mismatch after disk reload! "
+                        f"Expected: {weight_version}; " + ", ".join(mismatches)
+                    )
+            if not self.args.update_weight_disk_keep_files:
+                shutil.rmtree(disk_weight_dir, ignore_errors=True)
+        finally:
+            resume_engines_after_weight_update(engines)

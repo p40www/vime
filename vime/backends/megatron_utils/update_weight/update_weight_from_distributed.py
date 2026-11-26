@@ -10,7 +10,11 @@ from ray.actor import ActorHandle
 
 from vime.platforms import current_platform
 from vime.utils.distributed_utils import get_gloo_group
-from vime.utils.weight_sync import should_flush_cache
+from vime.utils.weight_sync import (
+    pause_engines_for_weight_update,
+    resume_engines_after_weight_update,
+    should_flush_cache,
+)
 
 from ..dspark.export import export_dspark_model_weights
 from .common import HfWeightSource, VimeRayWeightSyncClient
@@ -93,44 +97,45 @@ class UpdateWeightFromDistributed:
             self.args.flush_cache_interval, self.weight_version, getattr(self.args, "update_weight_start_version", 0)
         )
 
-        if dist.get_rank() == 0:
-            ray.get(
-                [
-                    engine.pause_generation.remote(mode="abort" if flush_cache else "in_place")
-                    for engine in self.rollout_engines
-                ]
-            )
-            if flush_cache:
-                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=True,
-                    post_process_quantization=False,
-                    rollout_engines=self.rollout_engines,
-                )
-        dist.barrier(group=get_gloo_group())
+        engines = self.rollout_engines
+        paused = False
+        try:
+            if dist.get_rank() == 0:
+                pause_engines_for_weight_update(engines, flush_cache)
+                paused = True
+                if flush_cache:
+                    ray.get([engine.flush_cache.remote() for engine in engines])
+                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                    post_process_weights(
+                        restore_weights_before_load=True,
+                        post_process_quantization=False,
+                        rollout_engines=engines,
+                    )
+            dist.barrier(group=get_gloo_group())
 
-        client = self._trainer.client
-        client.draft = False
-        self._trainer.send_weights()
-        update_draft = self.args.dspark_enabled or (
-            self.args.enable_mtp_training and (self.args.vllm_speculative_config or {}).get("method") == "mtp"
-        )
-        if update_draft:
-            self._source.draft = self.args.dspark_enabled
-            client.draft = True
-            self._trainer.send_weights()
-            self._source.draft = False
+            client = self._trainer.client
             client.draft = False
+            self._trainer.send_weights()
+            update_draft = self.args.dspark_enabled or (
+                self.args.enable_mtp_training and (self.args.vllm_speculative_config or {}).get("method") == "mtp"
+            )
+            if update_draft:
+                self._source.draft = self.args.dspark_enabled
+                client.draft = True
+                self._trainer.send_weights()
+                self._source.draft = False
+                client.draft = False
 
-        if dist.get_rank() == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=False,
-                    post_process_quantization=True,
-                    rollout_engines=self.rollout_engines,
-                )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            if dist.get_rank() == 0:
+                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                    post_process_weights(
+                        restore_weights_before_load=False,
+                        post_process_quantization=True,
+                        rollout_engines=engines,
+                    )
+        finally:
+            if paused:
+                resume_engines_after_weight_update(engines)
         dist.barrier(group=get_gloo_group())
 
 

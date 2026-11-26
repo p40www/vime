@@ -17,7 +17,11 @@ from vime.platforms import current_platform
 from vime.utils import accelerator
 from vime.utils.distributed_utils import get_gloo_group
 from vime.utils.types import ParamInfo
-from vime.utils.weight_sync import should_flush_cache
+from vime.utils.weight_sync import (
+    pause_engines_for_weight_update,
+    resume_engines_after_weight_update,
+    should_flush_cache,
+)
 
 from ..dspark.export import export_dspark_model_weights
 from ..megatron_to_hf import convert_to_hf
@@ -372,54 +376,55 @@ class UpdateWeightFromTensor:
         flush_cache = should_flush_cache(
             self.args.flush_cache_interval, self.weight_version, getattr(self.args, "update_weight_start_version", 0)
         )
-        if self.rank == 0:
-            ray.get(
-                [
-                    engine.pause_generation.remote(mode="abort" if flush_cache else "in_place")
-                    for engine in self._all_rollout_engines
-                ]
-            )
-            if flush_cache:
-                ray.get([engine.flush_cache.remote() for engine in self._all_rollout_engines])
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=True,
-                    post_process_quantization=False,
-                    rollout_engines=self._all_rollout_engines,
-                )
-        dist.barrier(group=get_gloo_group())
+        engines = self._all_rollout_engines
+        paused = False
+        try:
+            if self.rank == 0:
+                pause_engines_for_weight_update(engines, flush_cache)
+                paused = True
+                if flush_cache:
+                    ray.get([engine.flush_cache.remote() for engine in engines])
+                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                    post_process_weights(
+                        restore_weights_before_load=True,
+                        post_process_quantization=False,
+                        rollout_engines=engines,
+                    )
+            dist.barrier(group=get_gloo_group())
 
-        if self._expert_transfer_plan:
-            megatron_local_weights = self.weights_getter()
-            self._update_rollout_weights(megatron_local_weights, draft=False)
-        else:
-            for trainer in self._native_trainers:
-                trainer.client.draft = False
-                trainer.send_weights()
-
-        update_draft = self.args.dspark_enabled or (
-            self.args.enable_mtp_training and (self.args.vllm_speculative_config or {}).get("method") == "mtp"
-        )
-        if update_draft:
-            if self._native_trainers:
-                self._source.draft = self.args.dspark_enabled
-                for trainer in self._native_trainers:
-                    trainer.client.draft = True
-                    trainer.send_weights()
-                    trainer.client.draft = False
-                self._source.draft = False
+            if self._expert_transfer_plan:
+                megatron_local_weights = self.weights_getter()
+                self._update_rollout_weights(megatron_local_weights, draft=False)
             else:
-                self._update_rollout_weights(megatron_local_weights, draft=True)
+                for trainer in self._native_trainers:
+                    trainer.client.draft = False
+                    trainer.send_weights()
 
-        # int4/fp4 post_process
-        if self.rank == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=False,
-                    post_process_quantization=True,
-                    rollout_engines=self._all_rollout_engines,
-                )
-            ray.get([engine.continue_generation.remote() for engine in self._all_rollout_engines])
+            update_draft = self.args.dspark_enabled or (
+                self.args.enable_mtp_training and (self.args.vllm_speculative_config or {}).get("method") == "mtp"
+            )
+            if update_draft:
+                if self._native_trainers:
+                    self._source.draft = self.args.dspark_enabled
+                    for trainer in self._native_trainers:
+                        trainer.client.draft = True
+                        trainer.send_weights()
+                        trainer.client.draft = False
+                    self._source.draft = False
+                else:
+                    self._update_rollout_weights(megatron_local_weights, draft=True)
+
+            # int4/fp4 post_process
+            if self.rank == 0:
+                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                    post_process_weights(
+                        restore_weights_before_load=False,
+                        post_process_quantization=True,
+                        rollout_engines=engines,
+                    )
+        finally:
+            if paused:
+                resume_engines_after_weight_update(engines)
         dist.barrier(group=get_gloo_group())
 
     def _update_rollout_weights(self, megatron_local_weights, *, draft: bool) -> None:

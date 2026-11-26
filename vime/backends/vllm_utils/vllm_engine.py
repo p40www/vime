@@ -359,9 +359,7 @@ class VLLMEngine(RayActor):
             worker_payload = dict(info)
             ipc_handles = worker_payload.pop("ipc_handles", None)
             if ipc_handles is not None:
-                worker_payload["ipc_handles_pickled"] = base64.b64encode(cloudpickle.dumps(ipc_handles)).decode(
-                    "utf-8"
-                )
+                worker_payload["ipc_handles_pickled"] = base64.b64encode(cloudpickle.dumps(ipc_handles)).decode("utf-8")
             payload.append(worker_payload)
         if not isinstance(update_info, list):
             payload = payload[0]
@@ -572,6 +570,10 @@ class VLLMEngine(RayActor):
         response = requests.post(f"http://{self.server_host}:{self.server_port}/resume", json={})
         response.raise_for_status()
         return response
+
+    def get_worker_type(self) -> str:
+        """PD role of this engine: regular / prefill / decode / encoder."""
+        return self.worker_type
 
     def post_process_weights(
         self,
@@ -804,10 +806,7 @@ def _compute_server_args(
         kwargs["enable_sleep_mode"] = True
         args.vllm_enable_sleep_mode = True
 
-    if (
-        getattr(args, "rollout_max_context_len", None) is not None
-        and getattr(args, "vllm_max_model_len", None) is None
-    ):
+    if getattr(args, "rollout_max_context_len", None) is not None and getattr(args, "vllm_max_model_len", None) is None:
         kwargs["max_model_len"] = args.rollout_max_context_len
 
     kwargs["weight_transfer_config"] = {"backend": "ipc" if args.colocate else "nccl"}
